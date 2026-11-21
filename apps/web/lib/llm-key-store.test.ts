@@ -9,11 +9,14 @@ import {
   type SecretKey
 } from "./encryption";
 import {
+  assertLlmDestination,
   buildSecretKeyLookup,
   decryptApiKey,
   encryptApiKey,
   getServerKeyLookup,
+  LlmDestinationError,
   migrateLegacyLlmApiKeys,
+  normalizeLlmDestination,
   readStoredApiKey,
   rotateLlmApiKeys,
   type LlmKeyMigrationClient,
@@ -291,5 +294,64 @@ describe("key rotation", () => {
 
     expect(summary.failed).toBe(1);
     expect(fixture.state[0]!.apiKeyEnvelope).toBe(oldEnvelope);
+  });
+});
+
+describe("destination binding (credential exfiltration fix)", () => {
+  const destination = "https://llm.example/v1";
+
+  describe("normalizeLlmDestination", () => {
+    it("includes scheme, host, port and path, and ignores query/hash", () => {
+      expect(normalizeLlmDestination("https://LLM.Example:8443/v1/?x=1#f")).toBe("https://llm.example:8443/v1");
+    });
+
+    it("treats trailing slashes as equivalent but real path changes as different", () => {
+      expect(normalizeLlmDestination(`${destination}/`)).toBe(destination);
+      expect(normalizeLlmDestination("https://llm.example/v2")).not.toBe(destination);
+    });
+
+    it("rejects unsupported schemes and embedded credentials", () => {
+      expect(() => normalizeLlmDestination("javascript:alert(1)")).toThrow(LlmDestinationError);
+      expect(() => normalizeLlmDestination("https://user:pass@llm.example/v1")).toThrow(LlmDestinationError);
+      expect(() => normalizeLlmDestination("not a url")).toThrow(LlmDestinationError);
+    });
+  });
+
+  describe("assertLlmDestination", () => {
+    const row = { apiKey: "", apiKeyEnvelope: "envelope", apiKeyDestination: destination };
+
+    it("accepts the exact approved destination", () => {
+      expect(() => assertLlmDestination(row, destination)).not.toThrow();
+      expect(() => assertLlmDestination(row, `${destination}/`)).not.toThrow();
+    });
+
+    it.each([
+      ["hostname", "https://attacker.example/v1"],
+      ["port", "https://llm.example:8443/v1"],
+      ["path", "https://llm.example/v2"],
+      ["scheme", "http://llm.example/v1"]
+    ])("rejects a changed %s", (_label, changed) => {
+      expect(() => assertLlmDestination(row, changed)).toThrow(LlmDestinationError);
+    });
+
+    it("fails closed for an unbound legacy row", () => {
+      expect(() => assertLlmDestination({ ...row, apiKeyDestination: null }, destination)).toThrow(
+        LlmDestinationError
+      );
+      expect(() => assertLlmDestination({ apiKey: "sk-legacy", apiKeyEnvelope: null }, destination)).toThrow(
+        LlmDestinationError
+      );
+    });
+
+    it("does not include the credential in its error message", () => {
+      try {
+        assertLlmDestination({ ...row, apiKey: "sk-DO-NOT-LEAK", apiKeyDestination: null }, destination);
+        throw new Error("expected failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(LlmDestinationError);
+        expect((error as Error).message).not.toContain("sk-DO-NOT-LEAK");
+        expect((error as Error).message).not.toContain("envelope");
+      }
+    });
   });
 });

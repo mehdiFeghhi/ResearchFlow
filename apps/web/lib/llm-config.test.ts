@@ -7,6 +7,7 @@ import {
   SecretEncryptionError,
   type SecretKey
 } from "./encryption";
+import { LlmDestinationError } from "./llm-key-store";
 
 const { findUnique, getEnv } = vi.hoisted(() => ({ findUnique: vi.fn(), getEnv: vi.fn() }));
 
@@ -16,6 +17,7 @@ vi.mock("@/lib/env", () => ({ getEnv }));
 const { resolveLlmConfig } = await import("./llm-config");
 
 const ACTIVE_MATERIAL = "active-key-material-at-least-32-bytes";
+const BASE_URL = "https://db.example/v1";
 
 function activeKey(): SecretKey {
   return createSecretKey(2, ACTIVE_MATERIAL);
@@ -23,6 +25,18 @@ function activeKey(): SecretKey {
 
 function encrypted(plaintext: string): string {
   return serializeEnvelope(encryptSecret(plaintext, activeKey()));
+}
+
+function row(overrides: Record<string, unknown> = {}) {
+  return {
+    workspaceId: "ws-1",
+    baseUrl: BASE_URL,
+    model: "db-model",
+    apiKey: "",
+    apiKeyEnvelope: encrypted("sk-resolved-key"),
+    apiKeyDestination: BASE_URL,
+    ...overrides
+  };
 }
 
 beforeEach(() => {
@@ -40,30 +54,18 @@ afterEach(() => {
 });
 
 describe("resolveLlmConfig", () => {
-  it("decrypts the stored envelope and returns a usable runtime config", async () => {
-    findUnique.mockResolvedValue({
-      workspaceId: "ws-1",
-      baseUrl: "https://db.example/v1",
-      model: "db-model",
-      apiKey: "",
-      apiKeyEnvelope: encrypted("sk-resolved-key")
-    });
+  it("decrypts the bound envelope and returns a usable runtime config", async () => {
+    findUnique.mockResolvedValue(row());
 
     await expect(resolveLlmConfig("ws-1")).resolves.toEqual({
-      baseUrl: "https://db.example/v1",
+      baseUrl: BASE_URL,
       model: "db-model",
       apiKey: "sk-resolved-key"
     });
   });
 
-  it("still resolves a not-yet-migrated legacy plaintext row", async () => {
-    findUnique.mockResolvedValue({
-      workspaceId: "ws-1",
-      baseUrl: "https://db.example/v1",
-      model: "db-model",
-      apiKey: "sk-legacy-key",
-      apiKeyEnvelope: null
-    });
+  it("still resolves a not-yet-migrated but bound plaintext row", async () => {
+    findUnique.mockResolvedValue(row({ apiKey: "sk-legacy-key", apiKeyEnvelope: null }));
 
     await expect(resolveLlmConfig("ws-1")).resolves.toMatchObject({ apiKey: "sk-legacy-key" });
   });
@@ -71,15 +73,26 @@ describe("resolveLlmConfig", () => {
   it("fails closed when a stored envelope cannot be decrypted", async () => {
     const envelope = parseEnvelope(encrypted("sk-real"));
     const first = envelope.ct.charAt(0);
-    findUnique.mockResolvedValue({
-      workspaceId: "ws-1",
-      baseUrl: "https://db.example/v1",
-      model: "db-model",
-      apiKey: "sk-stale-plaintext",
-      apiKeyEnvelope: serializeEnvelope({ ...envelope, ct: (first === "A" ? "B" : "A") + envelope.ct.slice(1) })
-    });
+    findUnique.mockResolvedValue(
+      row({
+        apiKey: "sk-stale-plaintext",
+        apiKeyEnvelope: serializeEnvelope({ ...envelope, ct: (first === "A" ? "B" : "A") + envelope.ct.slice(1) })
+      })
+    );
 
     await expect(resolveLlmConfig("ws-1")).rejects.toThrow(SecretEncryptionError);
+  });
+
+  it("refuses to use a bound key after the stored baseUrl changes", async () => {
+    findUnique.mockResolvedValue(row({ baseUrl: "https://attacker.example/v1" }));
+
+    await expect(resolveLlmConfig("ws-1")).rejects.toThrow(LlmDestinationError);
+  });
+
+  it("refuses an unbound legacy credential", async () => {
+    findUnique.mockResolvedValue(row({ apiKey: "sk-unbound", apiKeyEnvelope: null, apiKeyDestination: null }));
+
+    await expect(resolveLlmConfig("ws-1")).rejects.toThrow(LlmDestinationError);
   });
 
   it("keeps the env fallback unchanged when there is no DB row", async () => {

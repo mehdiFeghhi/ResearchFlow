@@ -9,7 +9,13 @@ import {
 } from "@paper-viewer/core/llm-config";
 import { requireCurrentUser, type CurrentUser } from "@/lib/auth";
 import { getEnv } from "@/lib/env";
-import { encryptApiKey, readStoredApiKey } from "@/lib/llm-key-store";
+import {
+  assertLlmDestination,
+  encryptApiKey,
+  LlmDestinationError,
+  normalizeLlmDestination,
+  readStoredApiKey
+} from "@/lib/llm-key-store";
 
 type ConfigSource = "db" | "env" | "none";
 
@@ -183,14 +189,22 @@ export async function PUT(request: Request) {
   const apiKey = trimmedOrEmpty(input.apiKey);
 
   if (apiKey) {
+    // The destination is approved together with the key: normalize it before
+    // any write so a malformed URL can never be persisted as a binding.
+    let apiKeyDestination: string;
+    try {
+      apiKeyDestination = normalizeLlmDestination(baseUrl);
+    } catch {
+      return Response.json({ error: "Invalid LLM base URL" }, { status: 400 });
+    }
     // Encrypt before persistence: the plaintext key never reaches Postgres.
-    // The legacy column is cleared in the same statement so a row can never be
-    // interpreted as both plaintext and ciphertext.
+    // Envelope, binding and legacy-column clearing are written in one UPSERT,
+    // so a failed update cannot leave a key attached to the wrong destination.
     const apiKeyEnvelope = encryptApiKey(apiKey);
     const row = await prisma.llmConfig.upsert({
       where: { workspaceId: user.workspaceId },
-      update: { baseUrl, model, apiKeyEnvelope, apiKey: "" },
-      create: { workspaceId: user.workspaceId, baseUrl, model, apiKeyEnvelope, apiKey: "" }
+      update: { baseUrl, model, apiKeyEnvelope, apiKeyDestination, apiKey: "" },
+      create: { workspaceId: user.workspaceId, baseUrl, model, apiKeyEnvelope, apiKeyDestination, apiKey: "" }
     });
     return Response.json(toConfigView({ source: "db", baseUrl: row.baseUrl, model: row.model, apiKey }));
   }
@@ -200,8 +214,9 @@ export async function PUT(request: Request) {
     return Response.json({ error: "首次保存必须提供 API Key" }, { status: 400 });
   }
 
-  // Blank key means "keep the existing one": touch only baseUrl/model so an
-  // encrypted key (or a not-yet-migrated legacy key) is preserved as-is.
+  // Blank key means "keep the existing one": touch only baseUrl/model, never
+  // the credential or its destination binding. The key is preserved but is NOT
+  // authorized for a changed baseUrl (see POST / resolveLlmConfig).
   const row = await prisma.llmConfig.update({
     where: { workspaceId: user.workspaceId },
     data: { baseUrl, model }
@@ -226,9 +241,10 @@ export async function POST(request: Request) {
   }
 
   const input = testSchema.parse(await request.json());
-  const current = await loadEffectiveConfig(user.workspaceId);
-  const baseUrl = trimmedOrEmpty(input.baseUrl) || current.baseUrl;
-  const model = trimmedOrEmpty(input.model) || current.model;
+  const row = await prisma.llmConfig.findUnique({ where: { workspaceId: user.workspaceId } });
+  const env = getEnv();
+  const baseUrl = trimmedOrEmpty(input.baseUrl) || row?.baseUrl || env.LLM_BASE_URL;
+  const model = trimmedOrEmpty(input.model) || row?.model || env.LLM_MODEL;
 
   // Test requests follow the same rule as saving: https only, to close off an SSRF
   // surface on the admin side (same as the notifications route)
@@ -236,11 +252,38 @@ export async function POST(request: Request) {
     return Response.json({ error: "Base URL 必须是 https 地址" }, { status: 400 });
   }
 
-  // The stored key is only attached when the configuration being tested is its
-  // own. Otherwise, changing the Base URL and clicking test would be enough to
-  // send the real key from the database to an arbitrary host.
-  const sameTarget = normalizeBaseUrl(baseUrl) === normalizeBaseUrl(current.baseUrl);
-  const apiKey = trimmedOrEmpty(input.apiKey) || (sameTarget ? current.apiKey : "");
+  // A submitted key is explicitly provided for this destination by the caller;
+  // no stored credential is involved.
+  let apiKey = trimmedOrEmpty(input.apiKey);
+  const unauthorized = () =>
+    Response.json(
+      { error: "Stored API key is bound to another destination. Re-enter the key to test a new base URL." },
+      { status: 400 }
+    );
+
+  if (!apiKey && row && (row.apiKeyEnvelope || row.apiKey)) {
+    // Check the persisted binding BEFORE decrypting or sending anything. The
+    // row's mutable baseUrl is deliberately not used as evidence of approval:
+    // it may have been changed to an attacker-controlled destination.
+    try {
+      assertLlmDestination(row, baseUrl);
+    } catch (error) {
+      if (error instanceof LlmDestinationError) return unauthorized();
+      throw error;
+    }
+    apiKey = readStoredApiKey(row);
+  } else if (!apiKey && !row && env.LLM_API_KEY) {
+    // Deployment-owned fallback key: its approved destination is the env config.
+    let matches = false;
+    try {
+      matches = normalizeLlmDestination(baseUrl) === normalizeLlmDestination(env.LLM_BASE_URL);
+    } catch {
+      matches = false;
+    }
+    if (!matches) return unauthorized();
+    apiKey = env.LLM_API_KEY;
+  }
+
   if (!apiKey) {
     return Response.json({
       ok: false,

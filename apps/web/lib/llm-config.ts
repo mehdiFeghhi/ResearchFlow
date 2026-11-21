@@ -1,6 +1,6 @@
 import { prisma } from "@paper-viewer/db";
 import { getEnv } from "@/lib/env";
-import { readStoredApiKey } from "@/lib/llm-key-store";
+import { assertLlmDestination, readStoredApiKey } from "@/lib/llm-key-store";
 
 export type LlmRuntimeConfig = { baseUrl: string; model: string; apiKey: string };
 
@@ -8,10 +8,15 @@ export type LlmRuntimeConfig = { baseUrl: string; model: string; apiKey: string 
 export async function resolveLlmConfig(workspaceId: string): Promise<LlmRuntimeConfig> {
   const row = await prisma.llmConfig.findUnique({ where: { workspaceId } });
   if (row) {
+    // A stored key may only be used for the destination it was saved with.
+    // A changed baseUrl (or an unbound legacy row) fails closed here, before
+    // decryption, so no key can be sent to a destination that was never
+    // approved for it.
+    assertLlmDestination(row, row.baseUrl);
     // Decryption happens only here, on the server, in memory. A bad envelope or
     // missing KEK throws (fail closed) instead of leaking a key or silently
     // falling back to another configuration.
-    const apiKey = readStoredApiKey({ apiKey: row.apiKey, apiKeyEnvelope: row.apiKeyEnvelope });
+    const apiKey = readStoredApiKey(row);
     return { baseUrl: row.baseUrl, model: row.model, apiKey };
   }
 

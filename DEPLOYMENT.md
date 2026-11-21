@@ -118,6 +118,8 @@ Everything else is configured in the UI, not in environment variables:
 
 API keys entered in **Settings → LLM** are encrypted with AES-256-GCM before they reach Postgres; only a masked value (`sk-***abcd`) is ever returned to the browser. `LLM_KEY_ENCRYPTION_SECRET` is required for saving or resolving a stored key — if it is missing or too short, the operation fails closed instead of writing plaintext.
 
+A stored key is also bound to the base URL that was submitted with it. Changing the base URL while leaving the API key field blank preserves the key but does **not** authorize it for the new destination: connectivity tests and LLM requests reject it until the key is explicitly re-entered with the new base URL. Rows that predate this binding (including keys backfilled from plaintext) have no destination on record and fail closed until re-entered.
+
 **Migrating pre-existing plaintext keys.** After deploying the migration that adds `LlmConfig.apiKeyEnvelope`, run the explicit, idempotent data migration once:
 
 ```bash

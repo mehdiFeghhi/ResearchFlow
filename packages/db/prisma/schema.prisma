@@ -303,7 +303,11 @@ model LlmConfig {
   // API response (only a masked value is).
   apiKey         String   // legacy plaintext field; new writes store "" here
   apiKeyEnvelope String?  // serialized P1-T01 envelope (v/alg/kdf/kid/iv/tag/ct); NULL ⇒ legacy plaintext in `apiKey`
-  updatedAt      DateTime @updatedAt
+  // Normalized destination (scheme + host[:port] + base path) that was approved
+  // when the key was saved. NULL = legacy/unbound: the key may not be sent to
+  // any destination until it is explicitly re-entered with a base URL.
+  apiKeyDestination String?
+  updatedAt          DateTime @updatedAt
 }
 
 model WorkspacePaper {

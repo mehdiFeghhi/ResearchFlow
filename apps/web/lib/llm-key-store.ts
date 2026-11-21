@@ -5,6 +5,8 @@
  * Responsibilities:
  *   - Encrypt an API key into a versioned envelope before it reaches Postgres.
  *   - Decrypt it on the server only, via a version-aware key lookup.
+ *   - Bind each key to the exact normalized destination approved at save time;
+ *     a key is never authorized for a merely similar or newly configured host.
  *   - Reconcile legacy plaintext rows through an explicit, restartable,
  *     double-encryption-safe migration (no plaintext value is ever logged).
  *   - Re-encrypt historical key versions during rotation.
@@ -27,7 +29,52 @@ import {
 } from "./encryption";
 
 /** Minimal structural view of a persisted LLM credential. */
-export type StoredLlmKey = { apiKey: string; apiKeyEnvelope: string | null };
+export type StoredLlmKey = {
+  apiKey: string;
+  apiKeyEnvelope: string | null;
+  /** Destination approved when the key was saved; absent/Null ⇒ unbound legacy row. */
+  apiKeyDestination?: string | null;
+};
+
+/** Raised when a stored key would be sent to a destination other than the one it was saved for. */
+export class LlmDestinationError extends Error {
+  constructor() {
+    super("Stored LLM API key is not authorized for this destination.");
+    this.name = "LlmDestinationError";
+  }
+}
+
+/**
+ * Canonical destination identity: scheme, host (including a non-default port)
+ * and base path. Credentials in the URL are rejected. Query/hash are not part
+ * of a provider destination and are ignored.
+ */
+export function normalizeLlmDestination(baseUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new LlmDestinationError();
+  }
+  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) {
+    throw new LlmDestinationError();
+  }
+  const path = url.pathname.replace(/\/+$/, "");
+  return `${url.protocol}//${url.host}${path}`;
+}
+
+/**
+ * Fail closed unless the row has an explicit binding that matches the exact
+ * destination being used. Unbound legacy rows are never authorized: their key
+ * must be re-entered (with a base URL) before it can be sent anywhere.
+ */
+export function assertLlmDestination(row: StoredLlmKey, requestedBaseUrl: string): void {
+  const bound = row.apiKeyDestination;
+  if (!bound) throw new LlmDestinationError();
+  if (normalizeLlmDestination(bound) !== normalizeLlmDestination(requestedBaseUrl)) {
+    throw new LlmDestinationError();
+  }
+}
 
 /** `LLM_KEY_ENCRYPTION_SECRET_<N>` supplies historical KEK version N. */
 const HISTORICAL_KEY_ENV = /^LLM_KEY_ENCRYPTION_SECRET_(\d+)$/;
@@ -70,9 +117,13 @@ export function decryptApiKey(envelope: string, lookup: SecretKeyLookup = getSer
  *
  * Encrypted rows are decrypted only here, on the server. If an envelope exists
  * but cannot be decrypted, the error propagates — we never fall back to the
- * legacy field, to an empty string, or to a different provider. Legacy rows
- * (envelope not yet backfilled) still resolve via their plaintext column, which
- * keeps the app working until the explicit migration is run.
+ * legacy field, to an empty string, or to a different provider. A legacy row
+ * (envelope not yet backfilled) can still resolve via its plaintext column, but
+ * only after a destination binding exists — unbound rows are rejected by the
+ * outbound callers via `assertLlmDestination`.
+ *
+ * Callers that will USE the key for an outbound request must first call
+ * `assertLlmDestination(row, destination)`; masking-only reads need not.
  */
 export function readStoredApiKey(row: StoredLlmKey, lookup?: SecretKeyLookup): string {
   if (row.apiKeyEnvelope) {
