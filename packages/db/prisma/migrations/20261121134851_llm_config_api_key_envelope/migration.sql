@@ -1,0 +1,11 @@
+-- P1-T02: envelope encryption for LLM API keys (ADR-013).
+--
+-- Additive only: the existing `apiKey` TEXT column keeps its type and its
+-- plaintext value. Data encryption is an explicit, restartable application
+-- step (`pnpm llm:keys:migrate`) because AES-256-GCM + HKDF require Node crypto
+-- and must never be attempted in SQL.
+--
+-- Before migration:  apiKeyEnvelope IS NULL, apiKey = '<plaintext>' (legacy)
+-- After migration:   apiKeyEnvelope = '<versioned envelope>', apiKey = ''
+-- New writes (route PUT): both fields are written explicitly in one statement.
+ALTER TABLE "LlmConfig" ADD COLUMN "apiKeyEnvelope" TEXT;

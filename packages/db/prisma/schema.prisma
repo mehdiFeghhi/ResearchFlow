@@ -293,12 +293,17 @@ model DailyDigest {
 }
 
 model LlmConfig {
-  id          String   @id @default(cuid())
-  workspaceId String   @unique
-  baseUrl     String
-  model       String
-  apiKey      String   // readable server-side; the API layer only ever returns a masked value
-  updatedAt   DateTime @updatedAt
+  id             String   @id @default(cuid())
+  workspaceId    String   @unique
+  baseUrl        String
+  model          String
+  // Legacy plaintext field. Rows written before P1-T02 keep their value here
+  // until `llm:keys:migrate` encrypts it; all new writes store "" here and put
+  // the versioned envelope in `apiKeyEnvelope` instead. Never returned by any
+  // API response (only a masked value is).
+  apiKey         String   // legacy plaintext field; new writes store "" here
+  apiKeyEnvelope String?  // serialized P1-T01 envelope (v/alg/kdf/kid/iv/tag/ct); NULL ⇒ legacy plaintext in `apiKey`
+  updatedAt      DateTime @updatedAt
 }
 
 model WorkspacePaper {

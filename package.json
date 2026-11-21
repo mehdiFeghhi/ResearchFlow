@@ -11,6 +11,8 @@
     "db:generate": "corepack pnpm --filter @paper-viewer/db prisma:generate",
     "db:migrate": "dotenv -e .env -- corepack pnpm --filter @paper-viewer/db prisma:migrate",
     "db:seed": "dotenv -e .env -- corepack pnpm --filter @paper-viewer/db prisma:seed",
+    "llm:keys:migrate": "dotenv -e .env -- corepack pnpm --filter @paper-viewer/db llm:keys:migrate",
+    "llm:keys:rotate": "dotenv -e .env -- corepack pnpm --filter @paper-viewer/db llm:keys:rotate",
     "deploy": "vercel deploy --prod"
   },
   "pnpm": {

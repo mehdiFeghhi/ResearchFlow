@@ -9,6 +9,7 @@ import {
 } from "@paper-viewer/core/llm-config";
 import { requireCurrentUser, type CurrentUser } from "@/lib/auth";
 import { getEnv } from "@/lib/env";
+import { encryptApiKey, readStoredApiKey } from "@/lib/llm-key-store";
 
 type ConfigSource = "db" | "env" | "none";
 
@@ -68,7 +69,14 @@ async function resolveCurrentUser(): Promise<CurrentUser | null> {
 async function loadEffectiveConfig(workspaceId: string): Promise<EffectiveConfig> {
   const row = await prisma.llmConfig.findUnique({ where: { workspaceId } });
   if (row) {
-    return { source: "db", baseUrl: row.baseUrl, model: row.model, apiKey: row.apiKey };
+    return {
+      source: "db",
+      baseUrl: row.baseUrl,
+      model: row.model,
+      // Server-only decryption; the plaintext is used for masking and for the
+      // test request but is never placed in a response object.
+      apiKey: readStoredApiKey({ apiKey: row.apiKey, apiKeyEnvelope: row.apiKeyEnvelope })
+    };
   }
 
   const env = getEnv();
@@ -175,12 +183,16 @@ export async function PUT(request: Request) {
   const apiKey = trimmedOrEmpty(input.apiKey);
 
   if (apiKey) {
+    // Encrypt before persistence: the plaintext key never reaches Postgres.
+    // The legacy column is cleared in the same statement so a row can never be
+    // interpreted as both plaintext and ciphertext.
+    const apiKeyEnvelope = encryptApiKey(apiKey);
     const row = await prisma.llmConfig.upsert({
       where: { workspaceId: user.workspaceId },
-      update: { baseUrl, model, apiKey },
-      create: { workspaceId: user.workspaceId, baseUrl, model, apiKey }
+      update: { baseUrl, model, apiKeyEnvelope, apiKey: "" },
+      create: { workspaceId: user.workspaceId, baseUrl, model, apiKeyEnvelope, apiKey: "" }
     });
-    return Response.json(toConfigView({ source: "db", baseUrl: row.baseUrl, model: row.model, apiKey: row.apiKey }));
+    return Response.json(toConfigView({ source: "db", baseUrl: row.baseUrl, model: row.model, apiKey }));
   }
 
   const existing = await prisma.llmConfig.findUnique({ where: { workspaceId: user.workspaceId } });
@@ -188,11 +200,20 @@ export async function PUT(request: Request) {
     return Response.json({ error: "首次保存必须提供 API Key" }, { status: 400 });
   }
 
+  // Blank key means "keep the existing one": touch only baseUrl/model so an
+  // encrypted key (or a not-yet-migrated legacy key) is preserved as-is.
   const row = await prisma.llmConfig.update({
     where: { workspaceId: user.workspaceId },
     data: { baseUrl, model }
   });
-  return Response.json(toConfigView({ source: "db", baseUrl: row.baseUrl, model: row.model, apiKey: row.apiKey }));
+  return Response.json(
+    toConfigView({
+      source: "db",
+      baseUrl: row.baseUrl,
+      model: row.model,
+      apiKey: readStoredApiKey({ apiKey: existing.apiKey, apiKeyEnvelope: existing.apiKeyEnvelope })
+    })
+  );
 }
 
 export async function POST(request: Request) {

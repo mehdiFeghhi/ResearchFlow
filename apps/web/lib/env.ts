@@ -34,7 +34,15 @@ const envSchema = z.object({
   EMAIL_FROM: blankAsUndefined(z.string().min(1).default("Paper Viewer <onboarding@resend.dev>")),
   LLM_API_KEY: blankAsUndefined(z.string().min(1).optional()),
   LLM_BASE_URL: blankAsUndefined(z.string().url().default("https://api.deepseek.com")),
-  LLM_MODEL: blankAsUndefined(z.string().default("deepseek-v4-pro"))
+  LLM_MODEL: blankAsUndefined(z.string().default("deepseek-v4-pro")),
+  // Key-encryption key for envelope encryption of stored secrets (ADR-013).
+  // Optional here so unrelated deployments keep working; `getActiveEncryptionKey()`
+  // in lib/encryption.ts enforces presence and strength before any use. There is
+  // deliberately no default secret.
+  LLM_KEY_ENCRYPTION_SECRET: blankAsUndefined(z.string().min(32).optional()),
+  // Active key version written to new envelopes; historical keys are supplied
+  // to `decryptSecret` via a lookup when rotating.
+  LLM_KEY_ENCRYPTION_VERSION: blankAsUndefined(z.coerce.number().int().positive().optional())
 });
 
 type Env = z.infer<typeof envSchema>;

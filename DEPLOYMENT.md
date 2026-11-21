@@ -71,6 +71,9 @@ Set these in **Vercel → Settings → Environment Variables** (Production, and 
 | `CRON_SECRET` | ✅ | Auth for `/api/cron/*`. **Without it the daily digest never runs** |
 | `BLOB_READ_WRITE_TOKEN` | ✅ | Injected automatically when you create a Blob store — see step 5 |
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | optional | Fallback model config. Prefer the in-app per-workspace setting |
+| `LLM_KEY_ENCRYPTION_SECRET` | ✅ | KEK for encrypting in-app API keys at rest (AES-256-GCM). ≥32 bytes, e.g. `openssl rand -base64 32`. **Back it up — losing it makes stored keys unrecoverable.** Must be identical on every instance |
+| `LLM_KEY_ENCRYPTION_VERSION` | optional | Active KEK version written to new envelopes (default `1`). Increment when rotating |
+| `LLM_KEY_ENCRYPTION_SECRET_<N>` | optional | Historical KEK for version `N`; keep old values after rotating so old envelopes remain readable |
 | `RESEND_API_KEY` | optional | Sends invitation e-mails. Without it, invite links are copied manually |
 | `CONFERENCE_SOURCE_URL` | optional | Point the conference catalog at a different GitHub repo |
 | `MAX_PDF_UPLOAD_MB` | optional | Upload size cap (default 50) |
@@ -110,6 +113,59 @@ Everything else is configured in the UI, not in environment variables:
 </table>
 
 > **Model concurrency matters.** The digest analyses papers one after another and the same key serves in-app chat. On a plan limited to one concurrent request, a running digest will make chat fail until it finishes.
+
+### LLM key encryption runbook
+
+API keys entered in **Settings → LLM** are encrypted with AES-256-GCM before they reach Postgres; only a masked value (`sk-***abcd`) is ever returned to the browser. `LLM_KEY_ENCRYPTION_SECRET` is required for saving or resolving a stored key — if it is missing or too short, the operation fails closed instead of writing plaintext.
+
+**Migrating pre-existing plaintext keys.** After deploying the migration that adds `LlmConfig.apiKeyEnvelope`, run the explicit, idempotent data migration once:
+
+```bash
+pnpm llm:keys:migrate      # prints aggregate counts only, never key values
+```
+
+It selects only rows with `apiKeyEnvelope IS NULL AND apiKey <> ''`, encrypts each value, and clears the old column in a conditional update. Re-running is a no-op, concurrent runs cannot double-encrypt, and any row whose encryption fails is left untouched for a later retry. The app keeps reading legacy plaintext rows until they are migrated, so there is no downtime window. To roll back the schema change before running the data migration, drop the `apiKeyEnvelope` column; legacy rows are unaffected.
+
+**Rotating the KEK.** Generate a new secret, keep the old one under its version number, bump the active version, then re-encrypt:
+
+```bash
+# .env / Vercel:
+LLM_KEY_ENCRYPTION_SECRET="<new secret>"      LLM_KEY_ENCRYPTION_VERSION=2
+LLM_KEY_ENCRYPTION_SECRET_1="<old secret>"    # retained for decryption
+pnpm llm:keys:rotate                          # re-encrypts envelopes whose kid != 2
+```
+
+After every row reports rotated (and `failed = 0`), the historical variable may be removed. Keep at least one backup of every KEK version.
+
+**Recovering from a lost or replaced KEK.** Each stored key is an AES-256-GCM envelope whose data key is derived from the KEK that wrote it; decryption must verify the stored auth tag, and the application deliberately has no plaintext fallback. A key encrypted under a lost KEK therefore **cannot be recovered from the database** — get a fresh key from the provider and replace it. Do **not** simply change `LLM_KEY_ENCRYPTION_SECRET` and leave the old envelopes in place: every row encrypted with the old KEK becomes unreadable (LLM calls and the settings page fail closed), and if you also leave `LLM_KEY_ENCRYPTION_VERSION` unchanged, `pnpm llm:keys:rotate` will treat those envelopes as up to date because their `kid` still matches, and skip them. If the old KEK is still available, prefer the rotation procedure above instead: keep it as `LLM_KEY_ENCRYPTION_SECRET_<old version>`, bump `LLM_KEY_ENCRYPTION_VERSION`, and run `pnpm llm:keys:rotate`.
+
+When the old KEK is genuinely unavailable, recover each affected workspace as follows:
+
+1. Set a **new** `LLM_KEY_ENCRYPTION_SECRET` (≥32 bytes, e.g. `openssl rand -base64 32`) and bump `LLM_KEY_ENCRYPTION_VERSION` to a new number (for example `2`). Do not keep the old version number. Restart/redeploy so every instance uses the same values. Do not set a historical `LLM_KEY_ENCRYPTION_SECRET_<N>` for a KEK you no longer have.
+2. Sign in as an **owner or admin** of the affected workspace (`canManageWorkspaceSettings` allows `owner` and `admin` only). Copy the `paper_viewer_session` cookie from the signed-in browser session (DevTools → Application → Cookies). `GET /api/settings/llm` currently fails while the unreadable envelope is still stored — the Settings → LLM page shows a load error instead of the form — but signing in itself still works, and recovery does not need that page.
+3. Replace the workspace configuration with `PUT`. Supply a **non-empty** `apiKey`: leaving it blank preserves the existing (unreadable) envelope. The request body takes `baseUrl` (a URL), `model` (1–100 characters) and an optional `apiKey` (≤200 characters, required here); `workspaceId` is taken from the session, not the request.
+
+   ```bash
+   curl -sS -X PUT https://<host>/api/settings/llm \
+     -H 'Content-Type: application/json' \
+     -H 'Cookie: paper_viewer_session=<session-cookie-value>' \
+     -d '{
+       "baseUrl": "https://api.moonshot.ai/v1",
+       "model": "kimi-k2.5",
+       "apiKey": "<fresh-provider-api-key>"
+     }'
+   ```
+
+   A successful response contains `source: "db"`, the new `baseUrl`/`model` and a masked `apiKeyMasked`; the plaintext key is never returned. `PUT` overwrites the old envelope without decrypting it, which is why it works even when the original KEK is gone.
+4. Verify decryption with `GET` using the same cookie:
+
+   ```bash
+   curl -sS https://<host>/api/settings/llm \
+     -H 'Cookie: paper_viewer_session=<session-cookie-value>'
+   ```
+
+   A `200` response whose `apiKeyMasked` matches the prefix/suffix of the freshly entered key confirms the new envelope is readable. A `500` most likely means the new KEK/version is not configured consistently on all instances (other server errors are also possible); the crypto error message is generic and never contains the key.
+5. Repeat steps 2–4 for every workspace with an unreadable envelope — each workspace has its own `LlmConfig` row. After all keys are re-entered, old KEK variables can be removed from the deployment configuration.
 
 ## 8. Make the daily push punctual (optional)
 
